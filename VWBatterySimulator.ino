@@ -5,6 +5,7 @@
 
 #include <ACAN_ESP32.h>
 #define LED_BUILTIN 2
+#define MAX_CELL_COUNT 96
 
 const int BUFF_SIZE = 32; // make it big enough to hold your longest command
 
@@ -22,18 +23,26 @@ uint8_t currentModuleMessage = 0;//4 messages per module, send 1 at a time
 
 uint16_t cellVolatge = 3800;
 uint16_t moduleTemperature = 20;
+uint16_t cellVoltages[MAX_CELL_COUNT];
 
 uint16_t moduleAddresses[] = { 0x1B0, 0x1B4, 0x1B8, 0x1BC, 0x1C0, 0x1C4, 0x1C8, 0x1CC };
 uint32_t feedbackAddresses[] = { 0x1A555401, 0x1A555402, 0x1A555403, 0x1A555404, 0x1A555405, 0x1A555406, 0x1A555407, 0x1A555408 };
+uint16_t balancingStatus[] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};//each module of 12 has a isBalancing flag
 
 void printHelp() {
   Serial.println(F("Commands"));
   Serial.println(F("h - prints this message"));
+  Serial.println(F("S - prints the pack status"));
   Serial.println(F("V - Sets the mV of all the cells"));
+  Serial.println(F("Vx - Sets the mV of a cell in position given by x"));
+  Serial.println(F("Bx - Sets the balance resistor status 1 or 0 of cell x"));
+
   Serial.println(F("T - Sets the tempearture of modules"));
 
   Serial.println(F("P - Sets the Pack Count, e.g if paralleling packs and using a MITM"));
   Serial.println(F("Example: V=3800 - sets all cells to 3800mV"));
+  Serial.println(F("Example: V0=3900 - set cell 0 to 3900mV"));
+
 }
 
 void printSettings() {
@@ -45,6 +54,38 @@ void printSettings() {
     Serial.print(F("T: "));
     Serial.print(moduleTemperature);
     Serial.println(F("C"));
+
+    Serial.print(F("Cell Count: "));
+    Serial.println(moduleCount * 12);
+}
+
+void printStatus() {
+  //print the status of each module
+  for( uint8_t i = 1; i < moduleCount + 1; i++) {
+    Serial.print(F("Module: "));
+    Serial.print(i);
+    Serial.print(F(" Temperature: "));
+    Serial.println(moduleTemperature);
+
+    for(uint8_t cellIndex = 0; cellIndex < 12; cellIndex++) {
+      uint8_t voltageIndex = ((i - 1) * 12) + cellIndex;
+      Serial.print(cellIndex);
+      Serial.print(F(": "));
+      Serial.print(cellVoltages[voltageIndex]);
+      Serial.print(F("mV "));
+      if (cellIndex == 6) {
+        Serial.println();
+      }
+    }
+    Serial.println();
+    Serial.println();
+  }
+}
+
+void setAllCellVoltages() {
+  for (uint8_t i; i< MAX_CELL_COUNT; i++) {
+    cellVoltages[i] = cellVolatge;
+  }
 }
 
 
@@ -78,6 +119,7 @@ void setup() {
   timeoutTicker.attach(1, timeout);
   timeoutTicker.attach(0.1, sendCan);
 
+  setAllCellVoltages();
   
   Serial.println ("VW PHEV Battery Simulator running");
   printHelp();
@@ -112,26 +154,26 @@ void sendModuleTemperature(uint32_t frameId) {
 
 }
 
-void sendModuleVoltage(uint16_t frameId) {
+void sendModuleVoltage(uint16_t frameId, uint8_t startIndex) {
   outFrame.id = frameId;
   outFrame.ext = 0;
   outFrame.len = 8;
   
   outFrame.data[0] = 0;
-  outFrame.data[1] = ((cellVolatge - 1000 )  & 0xF) << 4;
-  outFrame.data[2] = (cellVolatge - 1000 ) >> 4 & 0xFF;
+  outFrame.data[1] = ((cellVoltages[startIndex] - 1000 )  & 0xF) << 4;
+  outFrame.data[2] = (cellVoltages[startIndex] - 1000 ) >> 4 & 0xFF;
   
   //cell2
-  outFrame.data[3] = (cellVolatge - 1000 )  & 0xFF;
-  outFrame.data[4] = (cellVolatge - 1000 ) >> 8 & 0xF;
+  outFrame.data[3] = (cellVoltages[startIndex + 1] - 1000 )  & 0xFF;
+  outFrame.data[4] = (cellVoltages[startIndex + 1] - 1000 ) >> 8 & 0xF;
 
   //cell 3
-  outFrame.data[4] =  (((cellVolatge - 1000 )  & 0xF) << 4) + outFrame.data[4];
-  outFrame.data[5] = (cellVolatge - 1000 >> 4 ) & 0xFF;
+  outFrame.data[4] =  (((cellVoltages[startIndex + 2] - 1000 )  & 0xF) << 4) + outFrame.data[4];
+  outFrame.data[5] = (cellVoltages[startIndex + 2 ] - 1000 >> 4 ) & 0xFF;
 
   //cell 4
-  outFrame.data[6] = (cellVolatge - 1000 )  & 0xFF;
-  outFrame.data[7] = (cellVolatge - 1000 ) >> 8 & 0xF;
+  outFrame.data[6] = (cellVoltages[startIndex + 3] - 1000 )  & 0xFF;
+  outFrame.data[7] = (cellVoltages[startIndex + 3] - 1000 ) >> 8 & 0xF;
 
   ACAN_ESP32::can.tryToSend(outFrame);
 
@@ -142,7 +184,10 @@ void sendCan() {
   if (isSending) {
     if (currentModuleMessage < 3) {
         uint16_t messageId = moduleAddresses[currentModule - 1] + currentModuleMessage;
-        sendModuleVoltage(messageId);
+        //get address of cell voltages, there's 3 messages per module, so 4 cells per message
+        //current module = 4 current message = 2 so 4 * 12
+        uint8_t index = ((currentModule - 1) * 12) + (currentModuleMessage * 4);
+        sendModuleVoltage(messageId, index);
     } else if (currentModuleMessage == 3) {
         sendModuleTemperature(feedbackAddresses[currentModule - 1]);
     }
@@ -184,10 +229,23 @@ void handleReceivedMessage(char *msg)
 
    if (cmdStr == "V") {
       cellVolatge = valueStr.toInt();
+      setAllCellVoltages();
       printSettings();
    } else if (cmdStr == "T") {
       moduleTemperature = valueStr.toInt();
       printSettings();
+   } else if (cmdStr == "h") {
+    printHelp();
+   } else if (cmdStr == "S") {
+    printStatus();
+   } else if (cmdStr.charAt(0) == 'V') {
+    cmdStr.remove(0,1);
+    uint8_t cellNumber = cmdStr.toInt();
+    cellVoltages[cellNumber] = valueStr.toInt();
+    Serial.print(F("Setting Cell: "));
+    Serial.print(cellNumber);
+    Serial.print(F(" to: "));
+    Serial.println(valueStr.toInt());
    }
 }
 
