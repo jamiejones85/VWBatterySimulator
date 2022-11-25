@@ -6,6 +6,8 @@
 #include <ACAN_ESP32.h>
 #define LED_BUILTIN 2
 
+const int BUFF_SIZE = 32; // make it big enough to hold your longest command
+
 volatile bool isSending = false; 
 unsigned long lastRecievedMillis = 0;
 
@@ -16,10 +18,13 @@ Ticker timeoutTicker;
 
 uint8_t moduleCount = 8; //default to one pack
 uint8_t currentModule = 1;
+uint8_t currentModuleMessage = 0;//4 messages per module, send 1 at a time
 
 uint16_t cellVolatge = 3800;
+uint16_t moduleTemperature = 20;
 
-uint16_t moduleAddresses[] = {0x1B0, 0x1B4, 0x1B8, 0x1BC, 0x1C0, 0x1C4, 0x1C8, 0x1CC};
+uint16_t moduleAddresses[] = { 0x1B0, 0x1B4, 0x1B8, 0x1BC, 0x1C0, 0x1C4, 0x1C8, 0x1CC };
+uint32_t feedbackAddresses[] = { 0x1A555401, 0x1A555402, 0x1A555403, 0x1A555404, 0x1A555405, 0x1A555406, 0x1A555407, 0x1A555408 };
 
 void printHelp() {
   Serial.println(F("Commands"));
@@ -29,6 +34,17 @@ void printHelp() {
 
   Serial.println(F("P - Sets the Pack Count, e.g if paralleling packs and using a MITM"));
   Serial.println(F("Example: V=3800 - sets all cells to 3800mV"));
+}
+
+void printSettings() {
+    Serial.println(F("Current Settings"));
+    Serial.print(F("V: "));
+    Serial.print(cellVolatge);
+    Serial.println(F("mV"));
+
+    Serial.print(F("T: "));
+    Serial.print(moduleTemperature);
+    Serial.println(F("C"));
 }
 
 
@@ -60,10 +76,12 @@ void setup() {
     Serial.println (errorCode2, HEX) ;
   }
   timeoutTicker.attach(1, timeout);
+  timeoutTicker.attach(0.1, sendCan);
 
   
   Serial.println ("VW PHEV Battery Simulator running");
   printHelp();
+  printSettings();
 }
 
 
@@ -76,10 +94,30 @@ void canCheck() {
   }
 }
 
+void sendModuleTemperature(uint32_t frameId) {
+  outFrame.id = frameId;
+  outFrame.ext = 1;
+  outFrame.len = 8;
+  outFrame.data[0] = (moduleTemperature + 40) * 2;
+  //report other 2 readings one degree above and below
+  outFrame.data[1] = (moduleTemperature + 41) * 2;
+  outFrame.data[2] = (moduleTemperature + 39) * 2;
+  outFrame.data[3] = 0;
+  outFrame.data[4] = 0;
+  outFrame.data[5] = 0;
+  outFrame.data[6] = 0;
+  outFrame.data[7] = 0;
+
+  ACAN_ESP32::can.tryToSend(outFrame);
+
+}
+
 void sendModuleVoltage(uint16_t frameId) {
   outFrame.id = frameId;
   outFrame.ext = 0;
-
+  outFrame.len = 8;
+  
+  outFrame.data[0] = 0;
   outFrame.data[1] = ((cellVolatge - 1000 )  & 0xF) << 4;
   outFrame.data[2] = (cellVolatge - 1000 ) >> 4 & 0xFF;
   
@@ -99,26 +137,95 @@ void sendModuleVoltage(uint16_t frameId) {
 
 }
 
-//send a modules messages
-void sendModuleVoltages(uint8_t moduleNumber) {
-  sendModuleVoltage(moduleAddresses[moduleNumber]);
-  sendModuleVoltage(moduleAddresses[moduleNumber] + 1);
-  sendModuleVoltage(moduleAddresses[moduleNumber] + 2);
-}
 
 void sendCan() {
   if (isSending) {
-    sendModuleVoltages(currentModule);
+    if (currentModuleMessage < 3) {
+        uint16_t messageId = moduleAddresses[currentModule - 1] + currentModuleMessage;
+        sendModuleVoltage(messageId);
+    } else if (currentModuleMessage == 3) {
+        sendModuleTemperature(feedbackAddresses[currentModule - 1]);
+    }
 
+    currentModuleMessage++;
+    if (currentModuleMessage > 3) {
+      currentModuleMessage = 0;
+      currentModule++;
+    }
+    
     if (currentModule > moduleCount) {
       currentModule = 1;
     }
   }
 }
 
+void handleReceivedMessage(char *msg)
+{
+   String cmdStr;
+   String valueStr;
+   bool equalsFound = false;
+
+   for (uint8_t i = 0; i < BUFF_SIZE + 1;  i++) {
+
+      if (msg[i] == '=') {
+        equalsFound = true;
+      }
+
+      if (msg[i] == '\0') {
+        break;
+      }
+
+      if (!equalsFound) {
+        cmdStr += msg[i];
+      } else if(msg[i] != '=') {
+        valueStr += msg[i];
+      }
+   }
+
+   if (cmdStr == "V") {
+      cellVolatge = valueStr.toInt();
+      printSettings();
+   } else if (cmdStr == "T") {
+      moduleTemperature = valueStr.toInt();
+      printSettings();
+   }
+}
+
+void handleSerial()
+{
+    static char buffer[BUFF_SIZE+1]; // +1 allows space for the null terminator
+    static int length = 0; // number of characters currently in the buffer
+
+    if(Serial.available())
+    {
+        char c = Serial.read();
+        if((c == '\r') || (c == '\n'))
+        {
+            // end-of-line received
+            if(length > 0)
+            {
+                handleReceivedMessage(buffer);
+            }
+            length = 0;
+        }
+        else
+        {
+            if(length < BUFF_SIZE)
+            {
+                buffer[length++] = c; // append the received character to the array
+                buffer[length] = 0; // append the null terminator
+            }
+            else
+            {
+                // buffer full - discard the received character
+            }
+        }
+    }
+}
+
 
 void loop() {
   // put your main code here, to run repeatedly:
   canCheck();
-  sendCan();
+  handleSerial();
 }
