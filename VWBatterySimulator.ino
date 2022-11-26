@@ -10,6 +10,7 @@
 const int BUFF_SIZE = 32; // make it big enough to hold your longest command
 
 volatile bool isSending = false; 
+bool isForced = false;
 unsigned long lastRecievedMillis = 0;
 
 CANMessage inFrame;
@@ -27,12 +28,13 @@ uint16_t cellVoltages[MAX_CELL_COUNT];
 
 uint16_t moduleAddresses[] = { 0x1B0, 0x1B4, 0x1B8, 0x1BC, 0x1C0, 0x1C4, 0x1C8, 0x1CC };
 uint32_t feedbackAddresses[] = { 0x1A555401, 0x1A555402, 0x1A555403, 0x1A555404, 0x1A555405, 0x1A555406, 0x1A555407, 0x1A555408 };
-uint16_t balancingStatus[] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};//each module of 12 has a isBalancing flag
+uint16_t balancingStatus[] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};//each module of 12 has a isBalancing flag, 0x01 is cell 1 0x800 is cell 12
 
 void printHelp() {
   Serial.println(F("Commands"));
   Serial.println(F("h - prints this message"));
   Serial.println(F("S - prints the pack status"));
+  Serial.println(F("F - Force Sending even if 0x0BA not recieved"));
   Serial.println(F("V - Sets the mV of all the cells"));
   Serial.println(F("Vx - Sets the mV of a cell in position given by x"));
   Serial.println(F("Bx - Sets the balance resistor status 1 or 0 of cell x"));
@@ -59,6 +61,13 @@ void printSettings() {
     Serial.println(moduleCount * 12);
 }
 
+bool isCellBalancing(uint8_t cellIndex, uint8_t moduleIndex) {
+
+  //uint16_t enableFlag = 0x1 << (cellIndex);
+  uint16_t enabledFlag = (balancingStatus[moduleIndex] >> (cellIndex)) & 0x1;
+  return enabledFlag == 0x1;
+}
+
 void printStatus() {
   //print the status of each module
   for( uint8_t i = 1; i < moduleCount + 1; i++) {
@@ -66,19 +75,22 @@ void printStatus() {
     Serial.print(i);
     Serial.print(F(" Temperature: "));
     Serial.println(moduleTemperature);
-
     for(uint8_t cellIndex = 0; cellIndex < 12; cellIndex++) {
       uint8_t voltageIndex = ((i - 1) * 12) + cellIndex;
       Serial.print(cellIndex);
       Serial.print(F(": "));
       Serial.print(cellVoltages[voltageIndex]);
       Serial.print(F("mV "));
+      if (isCellBalancing(cellIndex, i-1)) {
+        Serial.print(F("B "));
+      }
       if (cellIndex == 6) {
         Serial.println();
       }
     }
     Serial.println();
     Serial.println();
+
   }
 }
 
@@ -133,18 +145,20 @@ void canCheck() {
         lastRecievedMillis = millis();
         isSending = true;
     }
+    //handle balance requests
   }
 }
 
-void sendModuleTemperature(uint32_t frameId) {
+//add balance feedback
+void sendModuleTemperature(uint32_t frameId, uint8_t moduleIndex) {
   outFrame.id = frameId;
   outFrame.ext = 1;
   outFrame.len = 8;
   outFrame.data[0] = (moduleTemperature + 40) * 2;
-  //report other 2 readings one degree above and below
-  outFrame.data[1] = (moduleTemperature + 41) * 2;
-  outFrame.data[2] = (moduleTemperature + 39) * 2;
-  outFrame.data[3] = 0;
+ 
+  outFrame.data[1] = 0;
+  outFrame.data[2] = balancingStatus[moduleIndex]; 
+  outFrame.data[3] = balancingStatus[moduleIndex] >> 8;
   outFrame.data[4] = 0;
   outFrame.data[5] = 0;
   outFrame.data[6] = 0;
@@ -159,7 +173,6 @@ void sendModuleVoltage(uint16_t frameId, uint8_t startIndex) {
   outFrame.ext = 0;
   outFrame.len = 8;
   
-  outFrame.data[0] = 0;
   outFrame.data[1] = ((cellVoltages[startIndex] - 1000 )  & 0xF) << 4;
   outFrame.data[2] = (cellVoltages[startIndex] - 1000 ) >> 4 & 0xFF;
   
@@ -181,7 +194,7 @@ void sendModuleVoltage(uint16_t frameId, uint8_t startIndex) {
 
 
 void sendCan() {
-  if (isSending) {
+  if (isSending || isForced) {
     if (currentModuleMessage < 3) {
         uint16_t messageId = moduleAddresses[currentModule - 1] + currentModuleMessage;
         //get address of cell voltages, there's 3 messages per module, so 4 cells per message
@@ -189,7 +202,7 @@ void sendCan() {
         uint8_t index = ((currentModule - 1) * 12) + (currentModuleMessage * 4);
         sendModuleVoltage(messageId, index);
     } else if (currentModuleMessage == 3) {
-        sendModuleTemperature(feedbackAddresses[currentModule - 1]);
+        sendModuleTemperature(feedbackAddresses[currentModule - 1], currentModule - 1);
     }
 
     currentModuleMessage++;
@@ -202,6 +215,16 @@ void sendCan() {
       currentModule = 1;
     }
   }
+}
+
+uint8_t getModuleIndex(uint8_t cellNumber) {
+   return (cellNumber) / 12;
+}
+
+uint8_t getCellInModuleIndex(uint8_t moduleIndex, uint8_t cellNumber) {
+   uint8_t moduleStartIndex = moduleIndex * 12;
+   return cellNumber - moduleStartIndex;
+
 }
 
 void handleReceivedMessage(char *msg)
@@ -238,6 +261,11 @@ void handleReceivedMessage(char *msg)
     printHelp();
    } else if (cmdStr == "S") {
     printStatus();
+   } else if (cmdStr == "F") {
+    uint8_t force = valueStr.toInt();
+    isForced = force == 1;
+    Serial.print("Forced Sending: ");
+    Serial.println(isForced);
    } else if (cmdStr.charAt(0) == 'V') {
     cmdStr.remove(0,1);
     uint8_t cellNumber = cmdStr.toInt();
@@ -246,8 +274,29 @@ void handleReceivedMessage(char *msg)
     Serial.print(cellNumber);
     Serial.print(F(" to: "));
     Serial.println(valueStr.toInt());
+   } else if (cmdStr.charAt(0) == 'B') {
+    cmdStr.remove(0,1);
+    uint8_t cellNumber = cmdStr.toInt();
+    uint8_t moduleIndex = getModuleIndex(cellNumber);
+    uint8_t cellIndex = getCellInModuleIndex(moduleIndex, cellNumber);
+    Serial.print(F("Module: "));
+    Serial.print(moduleIndex);
+    Serial.print(F(" Cell: ")); 
+    Serial.print(cellIndex);
+    if (valueStr.toInt() == 1) {
+      uint16_t enableFlag = 0x1 << (cellIndex);
+      balancingStatus[moduleIndex] = balancingStatus[moduleIndex] | enableFlag;
+      Serial.println(F(" Balance On"));
+    } else {
+      uint16_t enableFlag = 0x1 << (cellIndex);
+      balancingStatus[moduleIndex] = balancingStatus[moduleIndex] ^ enableFlag;
+      Serial.println(F(" Balance Off"));
+    }
    }
 }
+
+
+
 
 void handleSerial()
 {
