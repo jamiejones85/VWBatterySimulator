@@ -28,7 +28,7 @@ uint16_t cellVoltages[MAX_CELL_COUNT];
 
 uint16_t moduleAddresses[] = { 0x1B0, 0x1B4, 0x1B8, 0x1BC, 0x1C0, 0x1C4, 0x1C8, 0x1CC };
 uint32_t feedbackAddresses[] = { 0x1A555401, 0x1A555402, 0x1A555403, 0x1A555404, 0x1A555405, 0x1A555406, 0x1A555407, 0x1A555408 };
-uint16_t balancingStatus[] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};//each module of 12 has a isBalancing flag, 0x01 is cell 1 0x800 is cell 12
+volatile uint16_t balancingStatus[] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};//each module of 12 has a isBalancing flag, 0x01 is cell 1 0x800 is cell 12
 
 void printHelp() {
   Serial.println(F("Commands"));
@@ -38,6 +38,7 @@ void printHelp() {
   Serial.println(F("V - Sets the mV of all the cells"));
   Serial.println(F("Vx - Sets the mV of a cell in position given by x"));
   Serial.println(F("Bx - Sets the balance resistor status 1 or 0 of cell x"));
+  Serial.println(F("M - Mock balance message"));
 
   Serial.println(F("T - Sets the tempearture of modules"));
 
@@ -138,6 +139,52 @@ void setup() {
   printSettings();
 }
 
+uint8_t getModuleStartIndexBalanceFrame(CANMessage message) {
+  switch(message.id) {
+    case (0x1A55540A) : return 0;
+    case (0x1A55540B) : return 0;
+    case (0x1A55540C) : return 1;
+    case (0x1A55540D) : return 1;
+    case (0x1A55540E) : return 2;
+    case (0x1A55540F) : return 2;
+    case (0x1A555410) : return 3;
+    case (0x1A555411) : return 2;
+    case (0x1A555412) : return 4;
+    case (0x1A555413) : return 4;
+    case (0x1A555414) : return 5;
+    case (0x1A555415) : return 5;
+    case (0x1A555416) : return 6;
+    case (0x1A555417) : return 6;
+    case (0x1A555418) : return 7;
+    case (0x1A555419) : return 7;
+  }
+}
+
+void setCellBalanceStatusFromCanMessage(uint8_t moduleIndex, uint8_t cellIndexInModule, uint8_t dataByte) {
+  if (dataByte > 0) {
+    //set is balancing
+     uint16_t enableFlag = 0x1 << (cellIndexInModule);
+     balancingStatus[moduleIndex] = balancingStatus[moduleIndex] | enableFlag;
+  } else {
+      balancingStatus[moduleIndex] = balancingStatus[moduleIndex] & ~(1 << cellIndexInModule);
+  }
+}
+
+void handleBalanceFrame(CANMessage message) {
+ uint8_t moduleIndex = getModuleStartIndexBalanceFrame(message);
+ uint8_t cellCount = 4;
+  if ((message.id % 2) == 0) {
+    cellCount = 8;
+  }
+  for (uint8_t i = 0; i < cellCount; i++) {
+     uint8_t cellIndexInModule = i;
+     if (cellCount == 4) {
+      cellIndexInModule = 8 + i;
+     }
+     //uint8_t moduleIndex, uint8_t cellIndexInModule, uint8_t dataByte
+    setCellBalanceStatusFromCanMessage(moduleIndex, cellIndexInModule, message.data[i]);
+  }
+}
 
 void canCheck() {
   if (ACAN_ESP32::can.receive (inFrame)) {
@@ -145,7 +192,10 @@ void canCheck() {
         lastRecievedMillis = millis();
         isSending = true;
     }
-    //handle balance requests
+    //handle balance requests, just one pack for now
+    if (inFrame.id >= 0x1A55540A && inFrame.id <= 0x1A555419){
+        void handleBalanceFrame(CANMessage inFrame);
+    }
   }
 }
 
@@ -292,6 +342,21 @@ void handleReceivedMessage(char *msg)
       balancingStatus[moduleIndex] = balancingStatus[moduleIndex] ^ enableFlag;
       Serial.println(F(" Balance Off"));
     }
+   } else if (cmdStr == "M") {
+    CANMessage msg;
+    msg.id = 0x1A55540A;
+    msg.ext = 1;
+    outFrame.len = 8;
+
+    msg.data[0] = 0xC;
+    msg.data[1] = 0xC;
+    msg.data[2] = 0xC;
+    msg.data[3] = 0x0;
+    msg.data[4] = 0x0;
+    msg.data[5] = 0x0;
+    msg.data[6] = 0x0;
+    msg.data[7] = 0x0;
+    handleBalanceFrame(msg);
    }
 }
 
